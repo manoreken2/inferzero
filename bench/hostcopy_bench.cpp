@@ -4,10 +4,12 @@
 //   Build:  .\build.ps1 bench\hostcopy_bench.cpp
 //   Run:    bin\hostcopy_bench.exe [MB ...]     (default: 0.25 0.375 0.5 1 2 4 8 16 40; fractions are MB too)
 //
-// The three lines, with every other argument defaulted (2 MB pieces, a ring of 4, one host sync per piece):
+// The three lines, with every other argument defaulted (2 MB pieces, a ring of 2 -- 4 MB of pinned host memory --
+// and one host sync per piece):
 //   hostcopy::HostCopy copy;
 //   copy.init(ctx, list_a, list_b);   // list_a copies GPU A -> host, list_b host -> GPU B: one thread each
-//   copy.copy(dst, src, bytes);       // for any size: it takes the faster of the two ways itself
+//   copy.copy(dst, src, bytes);       // for any size: it takes the faster of the two ways itself, and returns
+//                                     // ZE_RESULT_SUCCESS or the ze_result_t of the call that failed
 //   copy.term();                      // (the destructor does it too)
 //
 // The two ways copy() chooses between, both measured below:
@@ -25,17 +27,18 @@
 #include <cstdlib>
 #include <vector>
 
-// The median of `reps` timed calls of f (microseconds; -1 if a copy failed).
+// The median of `reps` timed calls of f (microseconds; -1 if a copy failed); the clock is integer nanoseconds.
+static float us(int64_t ns) { return (float)ns / 1000.0f; }  // (a span of nanoseconds as float microseconds)
 template <class F>
 static float median_us(F f, int reps, int warm = 5) {
   std::vector<float> t;
   t.reserve((size_t)reps);
   for (int r = 0; r < reps + warm; ++r) {
-    const double t0 = hostcopy::now_us();
+    const int64_t t0 = hostcopy::HostCopy::now_ns();
     const bool ok = f();
-    const double dt = hostcopy::now_us() - t0;
+    const int64_t dt = hostcopy::HostCopy::now_ns() - t0;
     if (!ok) return -1;
-    if (r >= warm) t.push_back((float)dt);
+    if (r >= warm) t.push_back(us(dt));
   }
   std::sort(t.begin(), t.end());
   return t[t.size() / 2];
@@ -116,15 +119,20 @@ int main(int argc, char** argv) {
   ZE_CHECK(zeMemAllocDevice(ctx, &dd, max_bytes, 64, dev_a, &src));
   ZE_CHECK(zeMemAllocDevice(ctx, &dd, max_bytes, 64, dev_b, &dst));
 
-  // ---- the whole subject in three lines (defaults: 2 MB pieces, a ring of 4, one host sync per piece) -------------
+  // ---- the whole subject in three lines (defaults: 2 MB pieces, a ring of 2, one host sync per piece) -------------
   hostcopy::HostCopy copy;
-  if (!copy.init(ctx, list_a, list_b)) {  // (the two lists must be different handles: one thread each)
-    fprintf(stderr, "init failed (pieces must be at least %zu KB)\n", hostcopy::HostCopy::kMinChunk >> 10);
+  const ze_result_t inited = copy.init(ctx, list_a, list_b);
+  if (inited != ZE_RESULT_SUCCESS) {  // (the two lists must be different handles: one thread each)
+    fprintf(stderr, "init failed (0x%08x; pieces must be at least %zu KB)\n", (unsigned)inited,
+            hostcopy::HostCopy::kMinChunk >> 10);
     return 1;
   }
-  const size_t pieces = (max_bytes + copy.chunk - 1) / copy.chunk;
-  printf("%zu GPU(s); pieces %zu MB, ring %d, %d per host sync; copying GPU 0 -> GPU %d (%zu pieces at most)\n",
-         gpus.size(), copy.chunk >> 20, copy.slots, copy.sync_every, gpus.size() > 1 ? 1 : 0, pieces);
+  const size_t pieces = (max_bytes + copy.piece_bytes() - 1) / copy.piece_bytes();
+  printf("%zu GPU(s); pieces %zu MB, ring %d (%zu MB of pinned host memory), %d per host sync;\n", gpus.size(),
+         copy.piece_bytes() >> 20, copy.ring_slots(),
+         ((size_t)copy.ring_slots() * copy.piece_bytes()) >> 20, copy.sync_each());
+  printf("copying GPU 0 -> GPU %d, %zu pieces at most; each wait gives up after %llu s\n",
+         gpus.size() > 1 ? 1 : 0, pieces, (unsigned long long)(hostcopy::HostCopy::kTimeoutNs / 1000000000ull));
 
   // ---- the comparison: the old path, the pieces, and what copy() picks -------------------------------------------
   printf("\n%8s %8s | %10s %7s | %15s %7s | %9s %8s\n", "bytes", "piece", "copy_whole", "GB/s", "copy_pipelined",
@@ -138,18 +146,19 @@ int main(int argc, char** argv) {
       return a < 0 || b < 0 ? -1.0f : std::min(a, b);
     };
     // (copy_whole puts the whole block in the ring, so it can only take what fits in it)
-    const float whole =
-        n <= (size_t)copy.slots * copy.chunk ? best([&] { return copy.copy_whole(dst, src, n); }) : -1;
+    const float whole = n <= (size_t)copy.ring_slots() * copy.piece_bytes()
+                            ? best([&] { return copy.copy_whole(dst, src, n) == ZE_RESULT_SUCCESS; })
+                            : -1;
     const size_t piece = copy.piece_for(n);  // (0 = copy() takes the whole-block path for this size)
     float pipelined = -1;
     if (piece != 0) {
-      const float a = copy.benchmark_us(dst, src, n, reps, 10, piece);
-      const float b = copy.benchmark_us(dst, src, n, reps, 10, piece);
+      const auto f = [&] { return copy.copy_pipelined(dst, src, n, piece); };
+      const float a = median_us(f, reps, 10), b = median_us(f, reps, 10);
       pipelined = a < 0 || b < 0 ? -1.0f : std::min(a, b);
     }
-    const float chosen = best([&] { return copy.copy(dst, src, n); });
+    const float chosen = best([&] { return copy.copy(dst, src, n) == ZE_RESULT_SUCCESS; });
     if (chosen < 0) {
-      printf("   failed\n");
+      printf("   failed (last_error 0x%08x)\n", (unsigned)copy.last_error());
       continue;
     }
     char label[16];
